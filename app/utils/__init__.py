@@ -1,6 +1,5 @@
 def execute_neo4j_query(query: str, params: dict = None):
     from neo4j import GraphDatabase
-
     from ..environments import NEO4J_PASSWORD, NEO4J_URI, NEO4J_USERNAME
 
     driver = GraphDatabase.driver(
@@ -9,12 +8,14 @@ def execute_neo4j_query(query: str, params: dict = None):
     try:
         with driver.session() as session:
             result = session.run(query, params)
-            return result
+            # Nếu truy vấn có RETURN thì trả về dữ liệu, không thì trả về None
+            if "RETURN" in query.upper():
+                return result.data()
+            return None
     except Exception as e:
         raise Exception(f'Error executing Neo4j query: {e}')
     finally:
         driver.close()
-
 
 def request_gemini(contents: str, model: str = 'gemini-2.0-flash'):
     """Request the Gemini API to generate content."""

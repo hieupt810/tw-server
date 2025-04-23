@@ -64,6 +64,18 @@ def get_cities():
         },
     )
 
+def find_city_by_postal_code(postal_code):
+    """
+    Tìm city theo postal_code. Trả về node city nếu tồn tại, ngược lại trả về None.
+    """
+    result = execute_neo4j_query(
+        "MATCH (c:City {postal_code: $postal_code}) RETURN c",
+        {'postal_code': postal_code}
+    )
+    if result and len(result) > 0:
+        return result[0]['c']
+    return None
+
 def drop_neo4j_database():
     """Delete all nodes and relationships in the Neo4j database."""
     result = execute_neo4j_query("MATCH (n) DETACH DELETE n", {})

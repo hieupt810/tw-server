@@ -4,6 +4,7 @@ from datetime import datetime, timezone
 from flask import Blueprint, abort, request
 from app.utils import execute_neo4j_query
 from app.utils.response import APIResponse
+from app.api.admin.cities import find_city_by_postal_code
 
 bp = Blueprint('locations', __name__, url_prefix='/locations')
 
@@ -210,15 +211,91 @@ def delete_all_locations_in_city(city_postal_code):
     execute_neo4j_query(query, {'city_postal_code': city_postal_code})
     return APIResponse.success(payload={'message': f'All locations in city {city_postal_code} have been deleted.'})
 
-# still bug
-# @bp.delete('/<location_id>')
-# def delete_location_by_id(location_id):
-#     """
-#     Xóa một location theo id. Khi xóa location, mối quan hệ giữa location và city cũng sẽ bị xóa tự động nhờ DETACH DELETE.
-#     """
-#     query = '''
-#     MATCH (l:Location {id: $location_id})
-#     DETACH DELETE l
-#     '''
-#     execute_neo4j_query(query, {'location_id': location_id})
-#     return APIResponse.success(payload={'message': f'Location {location_id} has been deleted.'})
+
+@bp.delete('/<location_id>')
+def delete_location_by_id(location_id):
+    """
+    Xóa một location theo id. Khi xóa location, mối quan hệ giữa location và city cũng sẽ bị xóa tự động nhờ DETACH DELETE.
+    """
+    # print(f"Deleting location with ID: {location_id}")
+    check_query = "MATCH (l:Location {id: $location_id}) RETURN l"
+    found = execute_neo4j_query(check_query, {'location_id': location_id})
+    if not found:
+        return APIResponse.error(f'Location {location_id} not found.', status=404)
+    query = '''
+    MATCH (l:Location {id: $location_id})
+    DETACH DELETE l
+    '''
+    execute_neo4j_query(query, {'location_id': location_id})
+    return APIResponse.success(payload={'message': f'Location {location_id} has been deleted.'})
+
+
+@bp.patch('/<location_id>')
+def update_location(location_id):
+    """
+    Update a location's info and/or change its parent city.
+    JSON body can include:
+      - city_postal_code: to change parent city
+      - location: dict of fields to update in the node
+    Only update if BOTH: location exists AND new city exists (if changing city). Otherwise, return 400.
+    """
+    data = request.get_json()
+    new_city_postal_code = data.get('city_postal_code')
+    location_updates = data.get('location', {})
+
+    # Check if location exists
+    check_location = execute_neo4j_query(
+        "MATCH (l:Location {id: $location_id}) RETURN l",
+        {'location_id': location_id}
+    )
+    if not check_location:
+        return APIResponse.error('Location does not exist.', status=400)
+
+    # If changing city, check if new city exists
+    if new_city_postal_code:
+        city = find_city_by_postal_code(new_city_postal_code)
+        if not city:
+            return APIResponse.error('New city does not exist.', status=400)
+
+    # If neither location_updates nor new_city_postal_code, do nothing
+    if not location_updates and not new_city_postal_code:
+        return APIResponse.error('No update data provided.', status=400)
+
+    # 1. Update location properties if provided
+    if location_updates:
+        set_clause = ', '.join([f"l.{k} = ${k}" for k in location_updates.keys()])
+        params = {**location_updates, 'location_id': location_id}
+        execute_neo4j_query(
+            f"""
+            MATCH (l:Location {{id: $location_id}})
+            SET {set_clause}
+            """,
+            params
+        )
+
+    # 2. Change parent city if needed
+    if new_city_postal_code:
+        execute_neo4j_query(
+            """
+            MATCH (old_city:City)-[r:HAS_LOCATION]->(l:Location {id: $location_id})
+            DELETE r
+            WITH l
+            MATCH (new_city:City {postal_code: $new_city_postal_code})
+            MERGE (new_city)-[:HAS_LOCATION]->(l)
+            """,
+            {'location_id': location_id, 'new_city_postal_code': new_city_postal_code}
+        )
+
+    return APIResponse.success(payload={'message': 'Location updated.'})
+
+
+@bp.get('/<location_id>')
+def get_location_by_id(location_id):
+    """
+    Lấy toàn bộ thông tin của một location theo id.
+    """
+    query = "MATCH (l:Location {id: $location_id}) RETURN l"
+    result = execute_neo4j_query(query, {'location_id': location_id})
+    if not result:
+        return APIResponse.error('Location not found.', status=404)
+    return APIResponse.success(payload=result[0]['l'])

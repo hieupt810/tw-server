@@ -178,24 +178,41 @@ def bulk_insert_hotels():
                 )
                 
             # Create and link HotelClass node if it exists
-            if hotel_data.get('hotelClass'):
+            if hotel_data.get('hotelClass') is not None:
                 try:
                     # Convert hotelClass to float (it might come as string like "5.0")
                     hotel_class_value = float(hotel_data.get('hotelClass'))
-                    execute_neo4j_query(
-                        '''
-                        MATCH (h:Hotel {name: $hotel_name, longitude: $longitude, latitude: $latitude})
-                        MERGE (hc:HotelClass {class: $hotel_class})
-                        MERGE (h)-[:HAS_CLASS]->(hc)
-                        ''',
-                        {
-                            'hotel_name': hotel_data.get('name'),
-                            'longitude': hotel_data.get('longitude'),
-                            'latitude': hotel_data.get('latitude'),
-                            'hotel_class': hotel_class_value
-                        }
-                    )
-                except (ValueError, TypeError):
+                    
+                    # For 0.0 values, create a relationship with "undefined" value
+                    if hotel_class_value == 0.0:
+                        execute_neo4j_query(
+                            '''
+                            MATCH (h:Hotel {name: $hotel_name, longitude: $longitude, latitude: $latitude})
+                            MERGE (hc:HotelClass {class: $hotel_class})
+                            MERGE (h)-[:HAS_CLASS]->(hc)
+                            ''',
+                            {
+                                'hotel_name': hotel_data.get('name'),
+                                'longitude': hotel_data.get('longitude'),
+                                'latitude': hotel_data.get('latitude'),
+                                'hotel_class': "undefined"
+                            }
+                        )
+                    else:
+                        execute_neo4j_query(
+                            '''
+                            MATCH (h:Hotel {name: $hotel_name, longitude: $longitude, latitude: $latitude})
+                            MERGE (hc:HotelClass {class: $hotel_class})
+                            MERGE (h)-[:HAS_CLASS]->(hc)
+                            ''',
+                            {
+                                'hotel_name': hotel_data.get('name'),
+                                'longitude': hotel_data.get('longitude'),
+                                'latitude': hotel_data.get('latitude'),
+                                'hotel_class': hotel_class_value
+                            }
+                        )
+                except (ValueError, TypeError) as e:
                     # If conversion fails, ignore this relationship
                     print(f"Warning: Could not convert hotelClass '{hotel_data.get('hotelClass')}' to float for hotel {hotel_data.get('name')}")
                     pass
@@ -278,6 +295,10 @@ def get_hotels():
     for item in results:
         hotel = schema.dump(item.get('h'))
         
+        # Ensure id field is included
+        if 'id' not in hotel and item.get('h').get('id'):
+            hotel['id'] = item.get('h').get('id')
+        
         # Add amenities from the query results
         if not hotel.get('amenities') and item.get('amenities'):
             hotel['amenities'] = item.get('amenities')
@@ -285,8 +306,9 @@ def get_hotels():
         # Add price_levels
         hotel['price_levels'] = item.get('price_levels', [])
         
-        # Add hotel_classes
-        hotel['hotel_classes'] = item.get('hotel_classes', [])
+        # Add hotel_classes and convert "0.0" to "undefined"
+        hotel_classes = item.get('hotel_classes', [])
+        hotel['hotel_classes'] = ["undefined" if str(cls) == "0.0" else str(cls) for cls in hotel_classes]
         
         # Calculate overall rating and round to 1 decimal place
         rh = hotel.get('rating_histogram')
@@ -308,3 +330,52 @@ def get_hotels():
         per_page=per_page,
         total_records=total_records_result[0]['total_records'],
     )
+
+@bp.get('/<id>')
+def get_hotel_by_id(id):
+    # Query the database for the specific hotel with amenities, price levels, and hotel classes
+    result = execute_neo4j_query(
+        """
+        MATCH (h:Hotel {id: $id})
+        OPTIONAL MATCH (h)-[:HAS_AMENITY]->(a:Amenity)
+        OPTIONAL MATCH (h)-[:HAS_PRICE_LEVEL]->(p:PriceLevel)
+        OPTIONAL MATCH (h)-[:HAS_CLASS]->(hc:HotelClass)
+        WITH h, collect(DISTINCT a.name) as amenities, collect(DISTINCT p.level) as price_levels, collect(DISTINCT hc.class) as hotel_classes
+        RETURN h, amenities, price_levels, hotel_classes
+        """,
+        {'id': id}
+    )
+    
+    if not result:
+        return APIResponse.error('Hotel not found', status=404)
+    
+    # Process the result
+    schema = HotelSchema()
+    item = result[0]
+    hotel = schema.dump(item.get('h'))
+    
+    # Add amenities from the query results
+    if not hotel.get('amenities') and item.get('amenities'):
+        hotel['amenities'] = item.get('amenities')
+    
+    # Add price_levels
+    hotel['price_levels'] = item.get('price_levels', [])
+    
+    # Add hotel_classes and convert "0.0" to "undefined"
+    hotel_classes = item.get('hotel_classes', [])
+    hotel['hotel_classes'] = ["undefined" if str(cls) == "0.0" else str(cls) for cls in hotel_classes]
+    
+    # Calculate overall rating and round to 1 decimal place
+    rh = hotel.get('rating_histogram')
+    if rh and isinstance(rh, list) and len(rh) == 5:
+        total = sum(rh)
+        if total > 0:
+            overall_rating = sum((i + 1) * rh[i] for i in range(5)) / total
+            overall_rating = round(overall_rating, 1)  # Round to 1 decimal place
+        else:
+            overall_rating = None
+    else:
+        overall_rating = None
+    hotel['overall_rating'] = overall_rating
+    
+    return APIResponse.success(data=hotel)

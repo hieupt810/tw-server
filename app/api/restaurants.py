@@ -55,24 +55,25 @@ def bulk_insert_restaurants():
             if len(photos) > 30:
                 photos = photos[:30]
             
-            # Process hours - simplify to just openHours and closeHours
+            # Process hours
+            simplified_hours = None
             hours_data = loc.get('hours', {})
-            simplified_hours = {}
-            if hours_data and 'weekRanges' in hours_data:
-                simplified_hours['weekRanges'] = []
-                for day_ranges in hours_data.get('weekRanges', []):
-                    day_hours = []
-                    for time_range in day_ranges:
-                        if 'openHours' in time_range and 'closeHours' in time_range:
-                            day_hours.append({
-                                'openHours': time_range.get('openHours', ''),
-                                'closeHours': time_range.get('closeHours', '')
-                            })
-                    simplified_hours['weekRanges'].append(day_hours)
+            if hours_data:
+                # Keep hours as a dictionary for schema validation
+                simplified_hours = {'weekRanges': []}
+                if 'weekRanges' in hours_data and isinstance(hours_data['weekRanges'], list):
+                    for day_ranges in hours_data.get('weekRanges', []):
+                        day_hours = []
+                        if isinstance(day_ranges, list):
+                            for time_range in day_ranges:
+                                if isinstance(time_range, dict) and 'openHours' in time_range and 'closeHours' in time_range:
+                                    day_hours.append({
+                                        'openHours': time_range.get('openHours', ''),
+                                        'closeHours': time_range.get('closeHours', '')
+                                    })
+                        simplified_hours['weekRanges'].append(day_hours)
             
-            hours_json = json.dumps(simplified_hours)
-            
-            # Prepare data for schema validation (schema's pre_load will handle cleaning)
+            # Prepare data for schema validation
             schema_input = {
                 'name': loc.get('name', ''),
                 'address': loc.get('address', ''),
@@ -90,17 +91,23 @@ def bulk_insert_restaurants():
                 'menuWebUrl': loc.get('menuWebUrl') or "",
                 'image': loc.get('image') or "",
                 'photos': photos,
-                'hours': hours_json,
                 'mealTypes': loc.get('mealTypes', []),
                 'cuisines': loc.get('cuisines', []),
                 'priceLevel': loc.get('priceLevel') or "",
                 'travelerChoiceAward': loc.get('travelerChoiceAward', False)
             }
             
+            # Add hours only if properly processed
+            if simplified_hours:
+                schema_input['hours'] = simplified_hours
+            
             # Validate with schema
             restaurant_data = schema.load(schema_input)
             restaurant_id = str(uuid.uuid4())
             created_at = datetime.now(timezone.utc).isoformat()
+            
+            # Convert hours to JSON string for Neo4j storage
+            hours_json = json.dumps(restaurant_data.get('hours', {})) if restaurant_data.get('hours') else '{}'
             
             # Create the Restaurant node and link directly to city
             execute_neo4j_query(
@@ -343,6 +350,10 @@ def get_restaurants():
         # Create restaurant dict (without hours)
         restaurant = schema.dump(r_node)
         
+        # Ensure id field is included
+        if 'id' not in restaurant and r_node.get('id'):
+            restaurant['id'] = r_node.get('id')
+        
         # Parse hours separately
         try:
             if isinstance(hours_str, str) and hours_str:
@@ -361,7 +372,9 @@ def get_restaurants():
         restaurant['cuisines'] = item.get('cuisines', [])
         restaurant['mealTypes'] = item.get('meal_types', [])
         restaurant['price_levels'] = item.get('price_levels', [])
-        restaurant['amenities'] = item.get('amenities', [])
+        
+        # Map amenities to features (for consistency with input data)
+        restaurant['features'] = item.get('amenities', [])
         
         # Calculate overall rating and round to 1 decimal place
         rh = restaurant.get('rating_histogram')
@@ -427,3 +440,74 @@ def debug_restaurant_hours():
         results.append(result)
     
     return APIResponse.success(data=results)
+
+@bp.get('/<id>')
+def get_restaurant_by_id(id):
+    # Query the database for the specific restaurant with related nodes
+    result = execute_neo4j_query(
+        """
+        MATCH (r:Restaurant {id: $id})
+        OPTIONAL MATCH (r)-[:HAS_CUISINE]->(c:Cuisine)
+        OPTIONAL MATCH (r)-[:SERVES_MEAL]->(m:MealType)
+        OPTIONAL MATCH (r)-[:HAS_PRICE_LEVEL]->(p:PriceLevel)
+        OPTIONAL MATCH (r)-[:HAS_AMENITY]->(a:Amenity)
+        WITH r, collect(DISTINCT c.name) as cuisines, collect(DISTINCT m.name) as meal_types, 
+             collect(DISTINCT p.level) as price_levels, collect(DISTINCT a.name) as amenities
+        RETURN r, cuisines, meal_types, price_levels, amenities
+        """,
+        {'id': id}
+    )
+    
+    if not result:
+        return APIResponse.error('Restaurant not found', status=404)
+    
+    # Process the result
+    schema = RestaurantSchema()
+    item = result[0]
+    r_node = item.get('r')
+    
+    # Get hours directly from node properties
+    hours_str = r_node.get('hours', '{}')
+    
+    # Create restaurant dict (without hours)
+    restaurant = schema.dump(r_node)
+    
+    # Parse hours separately
+    try:
+        if isinstance(hours_str, str) and hours_str:
+            # Remove escape characters that might cause issues
+            clean_hours_str = hours_str.replace('\\"', '"')
+            hours_obj = json.loads(clean_hours_str)
+            restaurant['hours'] = hours_obj
+        else:
+            restaurant['hours'] = {}
+    except Exception as e:
+        print(f"Error parsing hours for {restaurant.get('name')}: {str(e)}")
+        restaurant['hours'] = {}
+    
+    # Add relationship data
+    restaurant['cuisines'] = item.get('cuisines', [])
+    restaurant['mealTypes'] = item.get('meal_types', [])
+    restaurant['price_levels'] = item.get('price_levels', [])
+    
+    # Map amenities to features (for consistency with input data)
+    restaurant['features'] = item.get('amenities', [])
+    
+    # Calculate overall rating and round to 1 decimal place
+    rh = restaurant.get('rating_histogram')
+    if rh and isinstance(rh, list) and len(rh) == 5:
+        total = sum(rh)
+        if total > 0:
+            overall_rating = sum((i + 1) * rh[i] for i in range(5)) / total
+            overall_rating = round(overall_rating, 1)
+            restaurant['overall_rating'] = overall_rating
+        else:
+            restaurant['overall_rating'] = None
+    else:
+        restaurant['overall_rating'] = None
+    
+    # Remove priceLevel field since we have price_levels
+    if 'priceLevel' in restaurant:
+        del restaurant['priceLevel']
+    
+    return APIResponse.success(data=restaurant)

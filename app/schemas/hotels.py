@@ -52,7 +52,7 @@ class HotelSchema(ma.Schema):
     
     # These fields will be added by the GET API from relationship data
     price_levels = fields.List(fields.String(), load_only=False, dump_only=True)
-    hotel_classes = fields.List(fields.Float(), load_only=False, dump_only=True)
+    hotel_classes = fields.List(fields.String(), load_only=False, dump_only=True)
     
     # Rating data
     rating_histogram = fields.List(fields.Integer(), allow_none=True, default=list)

@@ -2,7 +2,6 @@ from marshmallow import fields, pre_load
 
 from app.extensions import ma
 
-from .cities import CitySchema
 
 class RoundedFloat(fields.Float):
     """Custom field that rounds float values to a specified number of decimal places"""

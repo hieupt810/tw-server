@@ -104,8 +104,8 @@ bp = Blueprint('things_to_do', __name__, url_prefix='/things-to-do')
 
 @bp.post('/bulk')
 def bulk_insert_things_to_do_from_api():
-    print("bulk_insert_things_to_do_from_api" )
-    print(1000)
+    # print("bulk_insert_things_to_do_from_api" )
+    # print(1000)
     url = "https://api.apify.com/v2/datasets/Z2rig8cqAIhDAlJqZ/items?clean=true&fields=name,address,description,longitude,latitude,ratingHistogram,subtype,subcategories,rawRanking,phone,website,image,photos&format=json"
     response = requests.get(url)
     data = response.json()
@@ -309,6 +309,11 @@ def get_things_to_do():
     things = []
     for item in results:
         thing = schema.dump(item.get('p'))
+        
+        # Ensure id field is included
+        if 'id' not in thing and item.get('p').get('id'):
+            thing['id'] = item.get('p').get('id')
+            
         # Add subtypes and subcategories
         thing['subtypes'] = item.get('subtypes', [])
         thing['subcategories'] = item.get('subcategories', [])
@@ -333,3 +338,45 @@ def get_things_to_do():
         per_page=per_page,
         total_records=total_records_result[0]['total_records'],
     )
+
+
+@bp.get('/<id>')
+def get_thing_to_do_by_id(id):
+    # Query the database for the specific thing to do with subtypes and subcategories
+    result = execute_neo4j_query(
+        """
+        MATCH (p:ThingToDo {id: $id})
+        OPTIONAL MATCH (p)-[:HAS_SUBTYPE]->(st:Subtype)
+        OPTIONAL MATCH (p)-[:HAS_SUBCATEGORY]->(sc:Subcategory)
+        WITH p, collect(DISTINCT st.name) as subtypes, collect(DISTINCT sc.name) as subcategories
+        RETURN p, subtypes, subcategories
+        """,
+        {'id': id}
+    )
+    
+    if not result:
+        return APIResponse.error('Thing to do not found', status=404)
+    
+    # Process the result
+    schema = ThingToDoSchema()
+    item = result[0]
+    thing = schema.dump(item.get('p'))
+    
+    # Add subtypes and subcategories
+    thing['subtypes'] = item.get('subtypes', [])
+    thing['subcategories'] = item.get('subcategories', [])
+    
+    # Calculate overall rating and round to 1 decimal place
+    rh = thing.get('rating_histogram')
+    if rh and isinstance(rh, list) and len(rh) == 5:
+        total = sum(rh)
+        if total > 0:
+            overall_rating = sum((i + 1) * rh[i] for i in range(5)) / total
+            overall_rating = round(overall_rating, 1)  # Round to 1 decimal place
+        else:
+            overall_rating = None
+    else:
+        overall_rating = None
+    thing['overall_rating'] = overall_rating
+    
+    return APIResponse.success(data=thing)

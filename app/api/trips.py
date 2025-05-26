@@ -100,14 +100,47 @@ def get_user_trips():
 
         result = []
         for trip in user_trips:
+            # Get all places for this trip
+            places = Trip.query.filter_by(trip_id=trip.id).all()
+            
+            # Initialize counters
+            number_hotel = 0
+            number_restaurant = 0
+            number_thingtodo = 0
+            
+            # Get place details from Neo4j in batch
+            place_ids = [place.place_id for place in places]
+            if place_ids:
+                place_types = execute_neo4j_query(
+                    """
+                    MATCH (p)
+                    WHERE elementId(p) IN $place_ids
+                    RETURN elementId(p) AS element_id, labels(p) AS types
+                    """,
+                    {'place_ids': place_ids},
+                )
+                
+                # Count place types
+                for place_type in place_types:
+                    types = place_type['types']
+                    if 'Hotel' in types:
+                        number_hotel += 1
+                    elif 'Restaurant' in types:
+                        number_restaurant += 1
+                    elif 'ThingToDo' in types:
+                        number_thingtodo += 1
+
             result.append(
                 {
                     'id': str(trip.id),
                     'name': trip.name,
                     'createdAt': trip.created_at.isoformat(),
                     'updatedAt': trip.updated_at.isoformat(),
-                    'placeCount': len(trip.trips),
+                    'placeCount': len(places),
                     'isOptimized': trip.is_optimized,
+                    'numberHotel': number_hotel,
+                    'numberRestaurant': number_restaurant,
+                    'numberThingtodo': number_thingtodo,
                 }
             )
 
@@ -282,6 +315,9 @@ def get_trip_places(trip_id):
                     'totalPlaces': 0,
                     'totalDistance': None,
                     'totalDistanceKm': None,
+                    'numberHotel': 0,
+                    'numberRestaurant': 0,
+                    'numberThingtodo': 0,
                 },
                 'places': [],
             }), 200
@@ -300,14 +336,26 @@ def get_trip_places(trip_id):
             """,
             {'place_ids': place_ids},
         )
-        print("place_ids", place_ids) 
-        print("results", results)
+
+        # Initialize counters
+        number_hotel = 0
+        number_restaurant = 0
+        number_thingtodo = 0
+
         # Process results and create a map of place_id to place details
         for result in results:
             place_data = result['p']
             place_id = result['element_id']
             place_types = result['types']
             city_data = result['c']
+
+            # Count place types
+            if 'Hotel' in place_types:
+                number_hotel += 1
+            elif 'Restaurant' in place_types:
+                number_restaurant += 1
+            elif 'ThingToDo' in place_types:
+                number_thingtodo += 1
 
             # Add city data if available
             if city_data:
@@ -419,6 +467,9 @@ def get_trip_places(trip_id):
                 'totalPlaces': len(place_details),
                 'totalDistance': total_distance,
                 'totalDistanceKm': total_distance_km,
+                'numberHotel': number_hotel,
+                'numberRestaurant': number_restaurant,
+                'numberThingtodo': number_thingtodo,
             },
             'places': TripPlaceSchema(many=True).dump(place_details),
         }

@@ -1,5 +1,6 @@
 import logging
 import json
+import re
 
 logger = logging.getLogger(__name__)
 
@@ -389,3 +390,80 @@ def delete_place_and_related_data(place_id: str) -> dict:
         deletion_summary['errors'].append(f"Unexpected error during deletion: {str(e)}")
         logger.error(f"Error in delete_place_and_related_data: {str(e)}")
         return deletion_summary
+
+
+def add_price_fields_to_neo4j_hotels():
+    """
+    One-time utility function to extract min_price and max_price from price_range 
+    strings and add them as properties to Hotel nodes in Neo4j.
+    
+    This should be run once to migrate existing data.
+    """
+    def extract_price_from_string(price_range_str):
+        """Extract min_price and max_price from price_range string."""
+        if not price_range_str:
+            return None, None
+        
+        price_str = price_range_str.strip()
+        
+        # Handle "$101+" format
+        if '+' in price_str:
+            match = re.search(r'\$(\d+)\+', price_str)
+            if match:
+                return int(match.group(1)), None
+        
+        # Handle "$1 - $25" format
+        matches = re.findall(r'\$(\d+)', price_str)
+        if len(matches) >= 2:
+            return int(matches[0]), int(matches[1])
+        elif len(matches) == 1:
+            return int(matches[0]), int(matches[0])
+        
+        return None, None
+
+    try:
+        # Get all hotels with price_range
+        hotels = execute_neo4j_query(
+            """
+            MATCH (h:Hotel)
+            WHERE h.price_range IS NOT NULL
+            RETURN elementId(h) AS hotel_id, h.price_range AS price_range
+            """,
+            {}
+        )
+        
+        updated_count = 0
+        error_count = 0
+        
+        for hotel in hotels:
+            hotel_id = hotel['hotel_id']
+            price_range = hotel['price_range']
+            
+            min_price, max_price = extract_price_from_string(price_range)
+            
+            try:
+                # Update hotel with min_price and max_price
+                execute_neo4j_query(
+                    """
+                    MATCH (h:Hotel)
+                    WHERE elementId(h) = $hotel_id
+                    SET h.min_price = $min_price, h.max_price = $max_price
+                    """,
+                    {
+                        'hotel_id': hotel_id,
+                        'min_price': min_price,
+                        'max_price': max_price
+                    }
+                )
+                updated_count += 1
+                print(f"Updated hotel {hotel_id} with min_price: {min_price}, max_price: {max_price}")
+            except Exception as e:
+                print(f"Error updating hotel {hotel_id}: {str(e)}")
+                error_count += 1
+        
+        print(f"Price field migration completed. Updated: {updated_count}, Errors: {error_count}")
+        return {'updated': updated_count, 'errors': error_count}
+        
+    except Exception as e:
+        print(f"Error during price field migration: {str(e)}")
+        return {'error': str(e)}

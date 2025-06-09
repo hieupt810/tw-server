@@ -13,6 +13,61 @@ logger = logging.getLogger(__name__)
 blueprint = Blueprint('hotels', __name__, url_prefix='/hotels')
 
 
+# Add utility function to extract price range from string
+def extract_price_range(price_range_str):
+    """
+    Extract min_price and max_price from price_range string.
+    
+    Examples:
+    "$1 - $25" -> (1, 25)
+    "$26 - $50" -> (26, 50)
+    "$101+" -> (101, None)
+    """
+    if not price_range_str:
+        return None, None
+    
+    import re
+    
+    # Remove extra spaces and convert to lower
+    price_str = price_range_str.strip()
+    
+    # Handle "$101+" format
+    if '+' in price_str:
+        match = re.search(r'\$(\d+)\+', price_str)
+        if match:
+            return int(match.group(1)), None
+    
+    # Handle "$1 - $25" format
+    matches = re.findall(r'\$(\d+)', price_str)
+    if len(matches) >= 2:
+        return int(matches[0]), int(matches[1])
+    elif len(matches) == 1:
+        return int(matches[0]), int(matches[0])
+    
+    return None, None
+
+
+# Add utility function to add min_price and max_price to hotel data
+def add_price_fields_to_hotels(hotels_data):
+    """Add min_price and max_price fields to hotel data based on Neo4j properties or price_range."""
+    for hotel in hotels_data:
+        # First check if min_price and max_price are already in the hotel data from Neo4j
+        if 'min_price' not in hotel or hotel.get('min_price') is None:
+            # Fallback to extracting from price_range string
+            price_range = hotel.get('price_range')
+            min_price, max_price = extract_price_range(price_range)
+            hotel['min_price'] = min_price
+            hotel['max_price'] = max_price
+        # If min_price exists but max_price doesn't, ensure both are set consistently
+        elif 'max_price' not in hotel or hotel.get('max_price') is None:
+            # If only min_price is available, try to extract max_price from price_range
+            price_range = hotel.get('price_range')
+            extracted_min, extracted_max = extract_price_range(price_range)
+            # Keep the existing min_price from Neo4j, but use extracted max_price if available
+            hotel['max_price'] = extracted_max
+    return hotels_data
+
+
 class AttachCitySchema(ma.Schema):
     created_at = fields.String(dump_only=True)
     element_id = fields.String(dump_only=True)
@@ -44,6 +99,9 @@ class ShortHotelSchema(ma.Schema):
     longitude = fields.Float(required=True)
     name = fields.String(required=True)
     price_levels = fields.List(fields.String(), required=False, default=list)
+    price_range = fields.String(required=False, allow_none=True)
+    min_price = fields.Integer(dump_only=True, allow_none=True)
+    max_price = fields.Integer(dump_only=True, allow_none=True)
     rating = fields.Float(required=False, allow_none=True)
     rating_histogram = fields.List(
         fields.Integer(), required=False, default=list
@@ -118,6 +176,8 @@ class HotelSchema(ShortHotelSchema):
     hotel_class = fields.String(required=False, allow_none=True)
     number_of_rooms = fields.Integer(required=False)
     price_range = fields.String(required=False, allow_none=True)
+    min_price = fields.Integer(dump_only=True, allow_none=True)
+    max_price = fields.Integer(dump_only=True, allow_none=True)
 
     @validates('number_of_rooms')
     def validate_number_of_rooms(self, value: int):
@@ -254,15 +314,117 @@ def get_hotels():
     # Get query parameters for pagination
     page = request.args.get('page', default=1, type=int)
     size = request.args.get('size', default=10, type=int)
-    search = request.args.get('search', default='', type=str)
     offset = (page - 1) * size
 
+    # Get search parameter
+    search = request.args.get('search', default='', type=str)
+    
+    # Get filter parameters - Updated to use min_price and max_price
+    min_price = request.args.get('min_price', type=int)
+    max_price = request.args.get('max_price', type=int)
+    hotel_class = request.args.get('hotel_class', type=float)
+    rating = request.args.get('rating', type=float)
+    
     user_id = None
     try:
         user_id = get_jwt_identity()
     except Exception:
         pass
 
+    # Determine operation mode: search vs filter
+    is_search_mode = bool(search.strip())
+    is_filter_mode = any([min_price is not None, max_price is not None, hotel_class is not None, rating is not None])
+    
+    if is_search_mode and is_filter_mode:
+        return {'error': 'Cannot use search and filter parameters simultaneously. Please use either search OR filter parameters.'}, 400
+    
+    if not is_search_mode and not is_filter_mode:
+        # Default behavior: return all hotels
+        return _get_all_hotels(page, size, offset, user_id)
+    elif is_search_mode:
+        return _search_hotels(search, page, size, offset, user_id)
+    else:
+        return _filter_hotels(min_price, max_price, hotel_class, rating, page, size, offset, user_id)
+
+
+def _get_all_hotels(page, size, offset, user_id):
+    """Get all hotels with pagination (default behavior)."""
+    # Check if the result is cached
+    redis = get_redis()
+    cache_key = f'hotels:page={page}:size={size}:all'
+    try:
+        cached_response = redis.get(cache_key)
+        if cached_response:
+            hotels = json.loads(cached_response)
+            # Add is_favorite field if user_id exists
+            if user_id:
+                hotel_ids = [hotel['element_id'] for hotel in hotels['data']]
+                favourites = (
+                    db.session.query(UserFavourite.place_id)
+                    .filter(
+                        UserFavourite.user_id == user_id,
+                        UserFavourite.place_id.in_(hotel_ids),
+                    )
+                    .all()
+                )
+                favourite_ids = set(f[0] for f in favourites)
+                for hotel in hotels['data']:
+                    hotel['is_favorite'] = hotel['element_id'] in favourite_ids
+            else:
+                for hotel in hotels['data']:
+                    hotel['is_favorite'] = False
+            return hotels, 200
+    except Exception as e:
+        logger.warning('Redis is not available to get data: %s', e)
+
+    # Create Cypher query parameters
+    query_params = {'offset': offset, 'size': size}
+    
+    # Get the total count of all hotels
+    count_query = """
+    MATCH (h:Hotel)
+    RETURN count(h) AS total_count
+    """
+    
+    total_count_result = execute_neo4j_query(count_query, query_params)
+    total_count = total_count_result[0]['total_count']
+
+    # Get all hotels with pagination
+    hotels_query = """
+    MATCH (h:Hotel)
+    OPTIONAL MATCH (h)-[:HAS_PRICE_LEVEL]->(pl:PriceLevel)
+    OPTIONAL MATCH (h)-[:LOCATED_IN]->(c:City)
+    RETURN h, elementId(h) AS element_id, collect(DISTINCT pl.level) AS price_levels, c AS city
+    ORDER BY h.raw_ranking DESC
+    SKIP $offset
+    LIMIT $size
+    """
+    
+    result = execute_neo4j_query(hotels_query, query_params)
+
+    # Process results - now includes price fields
+    hotels_data = _process_hotel_results(result, user_id)
+
+    # Create paginated response
+    response = create_paging(
+        data=ShortHotelSchema(many=True).dump(hotels_data),
+        page=page,
+        size=size,
+        offset=offset,
+        total_count=total_count,
+    )
+
+    # Cache the response for 6 hours
+    try:
+        redis.set(cache_key, json.dumps(response), ex=21600)
+    except Exception as e:
+        logger.warning('Redis is not available to set data: %s', e)
+
+    return response, 200
+
+
+def _search_hotels(search, page, size, offset, user_id):
+    """Search hotels by name."""
     # Check if the result is cached
     redis = get_redis()
     cache_key = f'hotels:page={page}:size={size}:search={search}'
@@ -292,28 +454,22 @@ def get_hotels():
         logger.warning('Redis is not available to get data: %s', e)
 
     # Create Cypher query parameters
-    query_params = {'offset': offset, 'size': size}
+    query_params = {'offset': offset, 'size': size, 'search': search}
     
-    # Base query with name search filter if provided
-    name_filter = ""
-    if search:
-        name_filter = "WHERE toLower(h.name) CONTAINS toLower($search) "
-        query_params['search'] = search
-
     # Get the total count of hotels matching the search criteria
-    count_query = f"""
+    count_query = """
     MATCH (h:Hotel)
-    {name_filter}
+    WHERE toLower(h.name) CONTAINS toLower($search)
     RETURN count(h) AS total_count
     """
     
     total_count_result = execute_neo4j_query(count_query, query_params)
     total_count = total_count_result[0]['total_count']
 
-    # Get the hotels with pagination, their price_levels, and city
-    hotels_query = f"""
+    # Get the hotels with pagination and search filter
+    hotels_query = """
     MATCH (h:Hotel)
-    {name_filter}
+    WHERE toLower(h.name) CONTAINS toLower($search)
     OPTIONAL MATCH (h)-[:HAS_PRICE_LEVEL]->(pl:PriceLevel)
     OPTIONAL MATCH (h)-[:LOCATED_IN]->(c:City)
     RETURN h, elementId(h) AS element_id, collect(DISTINCT pl.level) AS price_levels, c AS city
@@ -324,6 +480,153 @@ def get_hotels():
     
     result = execute_neo4j_query(hotels_query, query_params)
 
+    # Process results - now includes price fields
+    hotels_data = _process_hotel_results(result, user_id)
+
+    # Create paginated response
+    response = create_paging(
+        data=ShortHotelSchema(many=True).dump(hotels_data),
+        page=page,
+        size=size,
+        offset=offset,
+        total_count=total_count,
+    )
+
+    # Cache the response for 6 hours
+    try:
+        redis.set(cache_key, json.dumps(response), ex=21600)
+    except Exception as e:
+        logger.warning('Redis is not available to set data: %s', e)
+
+    return response, 200
+
+
+def _filter_hotels(min_price, max_price, hotel_class, rating, page, size, offset, user_id):
+    """Filter hotels based on criteria."""
+    # Build cache key based on filter parameters
+    cache_parts = [f'page={page}', f'size={size}', 'filter']
+    if min_price is not None:
+        cache_parts.append(f'min_price={min_price}')
+    if max_price is not None:
+        cache_parts.append(f'max_price={max_price}')
+    if hotel_class is not None:
+        cache_parts.append(f'hotel_class={hotel_class}')
+    if rating is not None:
+        cache_parts.append(f'rating={rating}')
+    
+    cache_key = f'hotels:{":".join(cache_parts)}'
+    
+    # Check if the result is cached
+    redis = get_redis()
+    try:
+        cached_response = redis.get(cache_key)
+        if cached_response:
+            hotels = json.loads(cached_response)
+            # Add is_favorite field if user_id exists
+            if user_id:
+                hotel_ids = [hotel['element_id'] for hotel in hotels['data']]
+                favourites = (
+                    db.session.query(UserFavourite.place_id)
+                    .filter(
+                        UserFavourite.user_id == user_id,
+                        UserFavourite.place_id.in_(hotel_ids),
+                    )
+                    .all()
+                )
+                favourite_ids = set(f[0] for f in favourites)
+                for hotel in hotels['data']:
+                    hotel['is_favorite'] = hotel['element_id'] in favourite_ids
+            else:
+                for hotel in hotels['data']:
+                    hotel['is_favorite'] = False
+            return hotels, 200
+    except Exception as e:
+        logger.warning('Redis is not available to get data: %s', e)
+
+    # Build filter conditions and parameters
+    filter_conditions = []
+    query_params = {'offset': offset, 'size': size}
+    
+    # Price range filter - Now using direct min_price and max_price properties from Neo4j
+    if min_price is not None:
+        filter_conditions.append("""
+        (h.min_price IS NOT NULL AND h.min_price >= $min_price) OR
+        (h.min_price IS NULL AND h.max_price IS NOT NULL AND h.max_price >= $min_price)
+        """)
+        query_params['min_price'] = min_price
+    
+    if max_price is not None:
+        filter_conditions.append("""
+        (h.max_price IS NOT NULL AND h.max_price <= $max_price) OR
+        (h.max_price IS NULL AND h.min_price IS NOT NULL AND h.min_price <= $max_price)
+        """)
+        query_params['max_price'] = max_price
+    
+    # Hotel class filter
+    if hotel_class is not None:
+        filter_conditions.append("toFloat(h.hotel_class) >= $hotel_class")
+        query_params['hotel_class'] = hotel_class
+    
+    # Rating filter
+    if rating is not None:
+        filter_conditions.append("h.rating >= $rating")
+        query_params['rating'] = rating
+    
+    # Build WHERE clause
+    where_clause = ""
+    if filter_conditions:
+        where_clause = f"WHERE {' AND '.join(filter_conditions)}"
+    
+    # Get the total count of hotels matching the filter criteria
+    count_query = f"""
+    MATCH (h:Hotel)
+    {where_clause}
+    RETURN count(h) AS total_count
+    """
+    
+    total_count_result = execute_neo4j_query(count_query, query_params)
+    total_count = total_count_result[0]['total_count']
+
+    # Get the hotels with pagination and filters
+    hotels_query = f"""
+    MATCH (h:Hotel)
+    {where_clause}
+    OPTIONAL MATCH (h)-[:HAS_PRICE_LEVEL]->(pl:PriceLevel)
+    OPTIONAL MATCH (h)-[:LOCATED_IN]->(c:City)
+    RETURN h, elementId(h) AS element_id, collect(DISTINCT pl.level) AS price_levels, c AS city
+    ORDER BY h.raw_ranking DESC
+    SKIP $offset
+    LIMIT $size
+    """
+    
+    result = execute_neo4j_query(hotels_query, query_params)
+
+    # Process results
+    hotels_data = _process_hotel_results(result, user_id)
+    
+    # Add min_price and max_price fields (fallback to extraction if not in Neo4j yet)
+    hotels_data = add_price_fields_to_hotels(hotels_data)
+
+    # Create paginated response
+    response = create_paging(
+        data=ShortHotelSchema(many=True).dump(hotels_data),
+        page=page,
+        size=size,
+        offset=offset,
+        total_count=total_count,
+    )
+
+    # Cache the response for 6 hours
+    try:
+        redis.set(cache_key, json.dumps(response), ex=21600)
+    except Exception as e:
+        logger.warning('Redis is not available to set data: %s', e)
+
+    return response, 200
+
+
+def _process_hotel_results(result, user_id):
+    """Process hotel query results and add element_id, price_levels, city, and price fields."""
     # Add element_id, price_levels, and city to each hotel record
     for record in result:
         record['h']['element_id'] = record['element_id']
@@ -334,6 +637,9 @@ def get_hotels():
         del record['city']
 
     hotels_data = [record['h'] for record in result]
+    
+    # Add min_price and max_price fields to all hotels
+    hotels_data = add_price_fields_to_hotels(hotels_data)
 
     # Add is_favorite field
     if user_id:
@@ -352,23 +658,8 @@ def get_hotels():
     else:
         for hotel in hotels_data:
             hotel['is_favorite'] = False
-
-    # Create paginated response
-    response = create_paging(
-        data=ShortHotelSchema(many=True).dump(hotels_data),
-        page=page,
-        size=size,
-        offset=offset,
-        total_count=total_count,
-    )
-
-    # Cache the response for 6 hours (without is_favorite, since it's user-specific)
-    try:
-        redis.set(cache_key, json.dumps(response), ex=21600)
-    except Exception as e:
-        logger.warning('Redis is not available to set data: %s', e)
-
-    return response, 200
+    
+    return hotels_data
 
 
 @blueprint.get('/<hotel_id>/')
@@ -402,6 +693,13 @@ def get_hotel(hotel_id):
                 hotel['is_favorite'] = bool(favourite)
             else:
                 hotel['is_favorite'] = False
+            
+            # Add min_price and max_price fields from price_range
+            price_range = hotel.get('price_range')
+            min_price, max_price = extract_price_range(price_range)
+            hotel['min_price'] = min_price
+            hotel['max_price'] = max_price
+            
             return schema.dump(hotel), 200
     except Exception as e:
         logger.warning('Redis is not available to get data: %s', e)
@@ -435,6 +733,12 @@ def get_hotel(hotel_id):
     hotel['price_levels'] = result[0]['price_levels']
     hotel['hotel_class'] = result[0]['hotel_class']
     hotel['city'] = result[0]['city']
+
+    # Add min_price and max_price fields from price_range
+    price_range = hotel.get('price_range')
+    min_price, max_price = extract_price_range(price_range)
+    hotel['min_price'] = min_price
+    hotel['max_price'] = max_price
 
     # Add is_favorite field
     if user_id:

@@ -72,15 +72,18 @@ def get_user_preferences(user_id: str) -> Dict:
             db.text("SELECT place_id FROM user_favourites WHERE user_id = :user_id"),
             {'user_id': user_id}
         )
-        favorite_place_ids = [row.place_id for row in favorites_result]
 
+        favorite_place_ids = [row.place_id for row in favorites_result]
+        # print("favorite_place_ids")
+        # print(favorite_place_ids)
         # Get user's reviews with ratings
         reviews_result = db.session.execute(
             db.text("SELECT place_id, rating FROM user_reviews WHERE user_id = :user_id"),
             {'user_id': user_id}
         )
         reviews = {row.place_id: row.rating for row in reviews_result}
-
+        # print("reviews")
+        # print(reviews)
         # Get place details from Neo4j for favorites and reviewed places
         all_place_ids = list(set(favorite_place_ids + list(reviews.keys())))
         
@@ -107,7 +110,8 @@ def get_user_preferences(user_id: str) -> Dict:
         """
         
         places_data = execute_neo4j_query(neo4j_query, {'place_ids': all_place_ids})
-        
+        print("places_data")
+        print(places_data)
         if not places_data:
             return {
                 'subcategories': {},
@@ -530,7 +534,7 @@ def apply_filters(places: List[Dict], filters: Dict) -> List[Dict]:
 
 
 @blueprint.get('/')
-@jwt_required()
+@jwt_required(optional=True)
 def get_recommendations():
     """Get personalized recommendations for the current user."""
     try:
@@ -544,7 +548,7 @@ def get_recommendations():
         user_id = get_jwt_identity()
         place_type = args['place_type']
         limit = args['limit']
-        
+
         # Check cache first
         cache_key = f"recommendations:{user_id}:{place_type}:{limit}"
         try:
@@ -558,7 +562,8 @@ def get_recommendations():
 
         # Get user preferences
         user_prefs = get_user_preferences(user_id)
-        
+        # print("user_prefs")
+        # print(user_prefs)
         recommendations = []
         
         # If user has enough interaction data, use hybrid approach
@@ -566,12 +571,16 @@ def get_recommendations():
             # Get collaborative filtering recommendations (30%)
             collab_recs = get_collaborative_recommendations(user_id, place_type, max(2, limit // 3))
             recommendations.extend(collab_recs)
-            
+            # print("collab_recs")
+            # print(collab_recs)
+
             # Get content-based recommendations (50%)
             content_limit = max(3, limit - len(collab_recs))
             content_recs = get_content_based_recommendations(user_id, place_type, content_limit, user_prefs)
             recommendations.extend(content_recs)
-            
+            # print("content_recs")
+            # print(content_recs)
+
         # Fill remaining slots with popular places
         current_place_ids = [place['element_id'] for place in recommendations]
         remaining_limit = limit - len(recommendations)
@@ -579,6 +588,9 @@ def get_recommendations():
         if remaining_limit > 0:
             popular_recs = get_popular_recommendations(place_type, remaining_limit, current_place_ids)
             recommendations.extend(popular_recs)
+            print("popular_recs")
+            print(popular_recs)
+
 
         # Remove duplicates and maintain order
         seen_ids = set()
@@ -589,11 +601,17 @@ def get_recommendations():
                 seen_ids.add(place_id)
                 unique_recommendations.append(place)
 
+        # print("unique_recommendations")
+        # print(unique_recommendations)
+
         # Apply additional filters
         filtered_recommendations = apply_filters(unique_recommendations, args)
 
         # Limit final results
         final_recommendations = filtered_recommendations[:limit]
+
+        # print("final_recommendations")
+        # print(final_recommendations)
 
         # Check if places are in user's favorites
         if final_recommendations:
@@ -656,7 +674,7 @@ def get_user_recommendation_stats():
     try:
         user_id = get_jwt_identity()
         user_prefs = get_user_preferences(user_id)
-        
+        print(user_prefs)
         stats = {
             'total_interactions': user_prefs['place_count'],
             'favorite_places_count': len(user_prefs['favorite_places']),
